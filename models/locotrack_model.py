@@ -18,6 +18,7 @@
 import functools
 from typing import Any, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union, Dict
 import re
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -25,8 +26,14 @@ import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
 
-import xformers.ops as xops
-from xformers.ops import fmha
+try:
+  import xformers.ops as xops
+  from xformers.ops import fmha
+  _XFORMERS_AVAILABLE = True
+except Exception:  # pragma: no cover - best-effort optional dependency
+  xops = None
+  fmha = None
+  _XFORMERS_AVAILABLE = False
 
 from models import utils
 
@@ -91,15 +98,18 @@ class LocalAttentionLayer(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.window_size = window_size
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
-        self.bias = fmha.attn_bias.LocalAttentionFromBottomRightMask(
-            window_left=window_size // 2,
-            window_right=window_size // 2,
-        )
+        self.bias = None
+        if _XFORMERS_AVAILABLE:
+            self.bias = fmha.attn_bias.LocalAttentionFromBottomRightMask(
+                window_left=window_size // 2,
+                window_right=window_size // 2,
+            )
 
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -110,8 +120,21 @@ class LocalAttentionLayer(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        x = xops.memory_efficient_attention(q, k, v, attn_bias=self.bias)
-        x = rearrange(x, 'b n h d -> b n (h d)')
+        if _XFORMERS_AVAILABLE and x.is_cuda:
+          x = xops.memory_efficient_attention(q, k, v, attn_bias=self.bias)
+          x = rearrange(x, 'b n h d -> b n (h d)')
+        else:
+          q = q.permute(0, 2, 1, 3)  # [B, H, N, D]
+          k = k.permute(0, 2, 1, 3)
+          v = v.permute(0, 2, 1, 3)
+          half_window = self.window_size // 2
+          idx = torch.arange(N, device=x.device)
+          dist = idx[None, :] - idx[:, None]
+          attn_mask = torch.zeros((N, N), device=x.device, dtype=q.dtype)
+          attn_mask.masked_fill_(dist < -half_window, float("-inf"))
+          attn_mask.masked_fill_(dist > half_window, float("-inf"))
+          x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+          x = x.permute(0, 2, 1, 3).reshape(B, N, C)
 
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -190,6 +213,8 @@ class LocoTrack(nn.Module):
       initial_resolution: Tuple[int, int] = (256, 256),
       dino_size: str = 'small',
       dino_reg: bool = False,
+      dino_pretrained: bool = True,
+      dino_weights: Optional[str] = None,
       adapter_intermed_channels: int = 128,
   ):
     super().__init__()
@@ -202,10 +227,10 @@ class LocoTrack(nn.Module):
     self.initial_resolution = tuple(initial_resolution)
 
     backbone_archs = {
-        "small": "vits14",
-        "base": "vitb14",
-        "large": "vitl14",
-        "giant": "vitg14",
+        "small": "vits16",
+        "base": "vitb16",
+        "large": "vitl16",
+        "giant": "vith16plus",
     }
     input_channels = {
         "small": 384,
@@ -215,9 +240,19 @@ class LocoTrack(nn.Module):
     }
 
     backbone_arch = backbone_archs[dino_size]
-    backbone_name = f"dinov2_{backbone_arch}{'_reg' if dino_reg else ''}"
+    backbone_name = f"dinov3_{backbone_arch}"
 
-    self.dino = torch.hub.load(repo_or_dir="facebookresearch/dinov2", model=backbone_name)
+    dino_repo_dir = Path(__file__).resolve().parents[1] / "dinov3"
+    dino_load_kwargs = {}
+    if dino_weights is not None:
+      dino_load_kwargs["weights"] = dino_weights
+    self.dino = torch.hub.load(
+      repo_or_dir=str(dino_repo_dir),
+      model=backbone_name,
+      source="local",
+      pretrained=dino_pretrained,
+      **dino_load_kwargs,
+    )
     self.adapter = build_dino_adapter(
       input_channels=input_channels[dino_size], 
       intermed_channels=adapter_intermed_channels,
@@ -558,7 +593,7 @@ class LocoTrack(nn.Module):
     self,
     video: torch.Tensor,
     use_bfloat16: bool = True,
-    img_mult: int = 64,
+    img_mult: Optional[int] = None,
   ):
     """
     Args:
@@ -572,9 +607,15 @@ class LocoTrack(nn.Module):
     video = (video - IMAGENET_DEFAULT_MEAN) / IMAGENET_DEFAULT_STD
     video = rearrange(video, 'b t h w c -> (b t) c h w')
 
-    img_mult = self.img_mult
-    vid_size = (14 * img_mult, 14 * img_mult)
-    H_f, W_f = img_mult, img_mult
+    if img_mult is None:
+      img_mult = self.img_mult
+
+    patch_size = getattr(self.dino, "patch_size", 16)
+    if isinstance(patch_size, (tuple, list)):
+      patch_size = patch_size[0]
+
+    vid_size = (patch_size * img_mult, patch_size * img_mult)
+    H_f = W_f = img_mult
 
     # add forward hooks for dino
     hooks = []
@@ -590,16 +631,19 @@ class LocoTrack(nn.Module):
       hooks.append(hook)
 
     video_resized = F.interpolate(video, size=vid_size, mode='bilinear', align_corners=False)
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_bfloat16): # Use bfloat16 for DINO
-      video_feat = self.dino.get_intermediate_layers(video_resized, n=1, return_class_token=False)
-    video_feat = rearrange(video_feat[-1], '(b t) (h w) c -> b t h w c', b=B, h=H_f, w=W_f)
-
-    for hook in hooks:
-      hook.remove()
+    device_type = "cuda" if video_resized.is_cuda else "cpu"
+    autocast_enabled = use_bfloat16 and device_type == "cuda"
+    try:
+      with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled): # Use bfloat16 for DINO
+        video_feat = self.dino.get_intermediate_layers(video_resized, n=1, return_class_token=False)
+      video_feat = rearrange(video_feat[-1], '(b t) (h w) c -> b t h w c', b=B, h=H_f, w=W_f)
+    finally:
+      for hook in hooks:
+        hook.remove()
 
     video_feat = video_feat / torch.sqrt(
       torch.maximum(
-          torch.sum(torch.square(video_feat), axis=-1, keepdims=True),
+          torch.sum(torch.square(video_feat), dim=-1, keepdim=True),
           torch.tensor(1e-6, device=video_feat.device),
       )
     )

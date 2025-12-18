@@ -130,7 +130,7 @@ def soft_argmax_heatmap_batched(softmax_val, threshold=5):
               coords[None, None, None, :, :, :] - pos[:, :, :, None, None, :]
           ),
           dim=-1,
-          keepdims=True,
+          keepdim=True,
       )
       < threshold**2
   )
